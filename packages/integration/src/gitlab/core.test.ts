@@ -18,6 +18,7 @@ import { rest } from 'msw';
 import { setupServer } from 'msw/node';
 import { GitLabIntegrationConfig } from './config';
 import { getGitLabFileFetchUrl, getGitLabRequestOptions } from './core';
+import { GitlabProjectIdMapCache } from './types';
 
 const worker = setupServer();
 
@@ -26,7 +27,14 @@ describe('gitlab core', () => {
   afterAll(() => worker.close());
   afterEach(() => worker.resetHandlers());
 
+  let mockCache: jest.Mocked<GitlabProjectIdMapCache>;
+
   beforeEach(() => {
+    mockCache = {
+      getProjectId: jest.fn(),
+      setProjectId: jest.fn(),
+    };
+
     worker.use(
       rest.get('*/api/v4/projects/group%2Fproject', (_, res, ctx) =>
         res(ctx.status(200), ctx.json({ id: 12345 })),
@@ -183,6 +191,108 @@ describe('gitlab core', () => {
         await expect(
           getGitLabFileFetchUrl(target, configWithNoToken),
         ).resolves.toBe(fetchUrl);
+      });
+    });
+
+    describe('with caching behavior', () => {
+      it('uses cached project ID when available', async () => {
+        const target =
+          'https://gitlab.com/group/project/-/blob/branch/folder/file.yaml';
+        const fetchUrl =
+          'https://gitlab.com/api/v4/projects/67890/repository/files/folder%2Ffile.yaml/raw?ref=branch';
+
+        // Mock cache to return a cached project ID
+        mockCache.getProjectId.mockReturnValue(67890);
+
+        const result = await getGitLabFileFetchUrl(
+          target,
+          configWithNoToken,
+          undefined,
+          mockCache,
+        );
+
+        expect(result).toBe(fetchUrl);
+        expect(mockCache.getProjectId).toHaveBeenCalledWith(
+          'https://gitlab.com-group/project',
+          'group/project',
+        );
+        expect(mockCache.setProjectId).not.toHaveBeenCalled();
+      });
+
+      it('fetches and caches project ID when not in cache', async () => {
+        const target =
+          'https://gitlab.com/group/project/-/blob/branch/folder/file.yaml';
+        const fetchUrl =
+          'https://gitlab.com/api/v4/projects/12345/repository/files/folder%2Ffile.yaml/raw?ref=branch';
+
+        // Mock cache to return undefined (cache miss)
+        mockCache.getProjectId.mockReturnValue(undefined);
+
+        const result = await getGitLabFileFetchUrl(
+          target,
+          configWithNoToken,
+          undefined,
+          mockCache,
+        );
+
+        expect(result).toBe(fetchUrl);
+        expect(mockCache.getProjectId).toHaveBeenCalledWith(
+          'https://gitlab.com-group/project',
+          'group/project',
+        );
+        expect(mockCache.setProjectId).toHaveBeenCalledWith(
+          'https://gitlab.com-group/project',
+          'group/project',
+          12345,
+        );
+      });
+
+      it('works with self-hosted GitLab with relative path caching', async () => {
+        const target =
+          'https://gitlab.mycompany.com/gitlab/group/project/-/blob/branch/folder/file.yaml';
+        const fetchUrl =
+          'https://gitlab.mycompany.com/gitlab/api/v4/projects/54321/repository/files/folder%2Ffile.yaml/raw?ref=branch';
+
+        // Mock cache to return a cached project ID
+        mockCache.getProjectId.mockReturnValue(54321);
+
+        const result = await getGitLabFileFetchUrl(
+          target,
+          configSelfHosteWithRelativePath,
+          undefined,
+          mockCache,
+        );
+
+        expect(result).toBe(fetchUrl);
+        expect(mockCache.getProjectId).toHaveBeenCalledWith(
+          'https://gitlab.mycompany.com/gitlab-group/project',
+          'group/project',
+        );
+        expect(mockCache.setProjectId).not.toHaveBeenCalled();
+      });
+
+      it('works with subgroups and caching', async () => {
+        const target =
+          'https://gitlab.com/group/subgroup/project/-/blob/branch/folder/file.yaml';
+        const fetchUrl =
+          'https://gitlab.com/api/v4/projects/98765/repository/files/folder%2Ffile.yaml/raw?ref=branch';
+
+        // Mock cache to return a cached project ID
+        mockCache.getProjectId.mockReturnValue(98765);
+
+        const result = await getGitLabFileFetchUrl(
+          target,
+          configWithNoToken,
+          undefined,
+          mockCache,
+        );
+
+        expect(result).toBe(fetchUrl);
+        expect(mockCache.getProjectId).toHaveBeenCalledWith(
+          'https://gitlab.com-group/subgroup/project',
+          'group/subgroup/project',
+        );
+        expect(mockCache.setProjectId).not.toHaveBeenCalled();
       });
     });
   });

@@ -45,6 +45,34 @@ import { Readable } from 'stream';
 import { ReadUrlResponseFactory } from './ReadUrlResponseFactory';
 import { ReaderFactory, ReadTreeResponseFactory } from './types';
 import { parseLastModified } from './util';
+import { GitlabProjectIdMapCache } from '@backstage/integration';
+
+interface GitlabProjectIdMapCacheEntry {
+  projectId: number;
+  lastUpdated: number;
+}
+
+class GitlabProjectIdMapCacheImpl implements GitlabProjectIdMapCache {
+  private readonly cache = new Map<string, GitlabProjectIdMapCacheEntry>();
+
+  constructor(private readonly cacheTTL: number) {}
+
+  getProjectId(projectPath: string, repository: string): number | undefined {
+    const cacheKey = `${projectPath}-${repository}`;
+    const cacheEntry = this.cache.get(cacheKey);
+    if (cacheEntry && Date.now() - cacheEntry.lastUpdated < this.cacheTTL) {
+      return cacheEntry.projectId;
+    }
+    return undefined;
+  }
+
+  setProjectId(projectPath: string, repository: string, projectId: number) {
+    this.cache.set(`${projectPath}-${repository}`, {
+      projectId,
+      lastUpdated: Date.now(),
+    });
+  }
+}
 
 /**
  * Implements a {@link @backstage/backend-plugin-api#UrlReaderService} for files on GitLab.
@@ -54,9 +82,13 @@ import { parseLastModified } from './util';
 export class GitlabUrlReader implements UrlReaderService {
   static factory: ReaderFactory = ({ config, treeResponseFactory }) => {
     const integrations = ScmIntegrations.fromConfig(config);
+    const projectIdMapCache = new GitlabProjectIdMapCacheImpl(
+      config.getOptionalNumber('gitlab.projectIdMapCacheTTL') ?? 1000 * 60 * 5, // 5 minutes
+    );
     return integrations.gitlab.list().map(integration => {
       const reader = new GitlabUrlReader(integration, {
         treeResponseFactory,
+        projectIdMapCache,
       });
       const predicate = (url: URL) => url.host === integration.config.host;
       return { reader, predicate };
@@ -65,7 +97,10 @@ export class GitlabUrlReader implements UrlReaderService {
 
   constructor(
     private readonly integration: GitLabIntegration,
-    private readonly deps: { treeResponseFactory: ReadTreeResponseFactory },
+    private readonly deps: {
+      treeResponseFactory: ReadTreeResponseFactory;
+      projectIdMapCache: GitlabProjectIdMapCache;
+    },
   ) {}
 
   async read(url: string): Promise<Buffer> {
@@ -340,7 +375,12 @@ export class GitlabUrlReader implements UrlReaderService {
       );
     }
     // Default to the old behavior of assuming the url is for a file
-    return getGitLabFileFetchUrl(target, this.integration.config, token);
+    return getGitLabFileFetchUrl(
+      target,
+      this.integration.config,
+      token,
+      this.deps.projectIdMapCache,
+    );
   }
 
   // convert urls of the form:
@@ -387,6 +427,14 @@ export class GitlabUrlReader implements UrlReaderService {
     }
     // Trim an initial / if it exists
     project = project.replace(/^\//, '');
+
+    const resultFromCache = this.deps.projectIdMapCache.getProjectId(
+      `${pathToProject.origin}${relativePath}`,
+      project,
+    );
+    if (resultFromCache) {
+      return resultFromCache;
+    }
     const result = await fetch(
       `${
         pathToProject.origin
@@ -401,8 +449,17 @@ export class GitlabUrlReader implements UrlReaderService {
         );
       }
 
+      if (result.status === 429) {
+        throw new Error('GitLab Error: 429 - Too Many Requests.');
+      }
+
       throw new Error(`Gitlab error: ${data.error}, ${data.error_description}`);
     }
+    this.deps.projectIdMapCache.setProjectId(
+      `${pathToProject.origin}${relativePath}`,
+      project,
+      Number(data.id),
+    );
     return Number(data.id);
   }
 }

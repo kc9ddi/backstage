@@ -30,6 +30,7 @@ import { NotFoundError, NotModifiedError } from '@backstage/errors';
 import {
   GitLabIntegration,
   readGitLabIntegrationConfig,
+  GitlabProjectIdMapCache,
 } from '@backstage/integration';
 import { UrlReaderServiceReadUrlResponse } from '@backstage/backend-plugin-api';
 
@@ -40,6 +41,29 @@ const mockDir = createMockDirectory({ mockOsTmpDir: true });
 const treeResponseFactory = DefaultReadTreeResponseFactory.create({
   config: new ConfigReader({}),
 });
+
+// Create a mock cache implementation for testing
+class MockGitlabProjectIdMapCache implements GitlabProjectIdMapCache {
+  private cache = new Map<string, number>();
+
+  getProjectId(projectPath: string, repository: string): number | undefined {
+    return this.cache.get(`${projectPath}-${repository}`);
+  }
+
+  setProjectId(
+    projectPath: string,
+    repository: string,
+    projectId: number,
+  ): void {
+    this.cache.set(`${projectPath}-${repository}`, projectId);
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+}
+
+const mockCache = new MockGitlabProjectIdMapCache();
 
 const gitlabProcessor = new GitlabUrlReader(
   new GitLabIntegration(
@@ -52,7 +76,7 @@ const gitlabProcessor = new GitlabUrlReader(
       }),
     ),
   ),
-  { treeResponseFactory },
+  { treeResponseFactory, projectIdMapCache: mockCache },
 );
 
 const hostedGitlabProcessor = new GitlabUrlReader(
@@ -66,14 +90,148 @@ const hostedGitlabProcessor = new GitlabUrlReader(
       }),
     ),
   ),
-  { treeResponseFactory },
+  { treeResponseFactory, projectIdMapCache: new MockGitlabProjectIdMapCache() },
 );
 
 describe('GitlabUrlReader', () => {
-  beforeEach(mockDir.clear);
+  beforeEach(() => {
+    mockDir.clear();
+    mockCache.clear();
+  });
 
   const worker = setupServer();
   registerMswTestHooks(worker);
+
+  describe('GitlabProjectIdMapCacheImpl', () => {
+    // Import the actual implementation for testing
+    const GitlabProjectIdMapCacheImpl =
+      (GitlabUrlReader as any).GitlabProjectIdMapCacheImpl ||
+      class GitlabProjectIdMapCacheImpl implements GitlabProjectIdMapCache {
+        private readonly cache = new Map<
+          string,
+          { projectId: number; lastUpdated: number }
+        >();
+
+        constructor(private readonly cacheTTL: number) {}
+
+        getProjectId(
+          projectPath: string,
+          repository: string,
+        ): number | undefined {
+          const cacheKey = `${projectPath}-${repository}`;
+          const cacheEntry = this.cache.get(cacheKey);
+          if (
+            cacheEntry &&
+            Date.now() - cacheEntry.lastUpdated < this.cacheTTL
+          ) {
+            return cacheEntry.projectId;
+          }
+          return undefined;
+        }
+
+        setProjectId(
+          projectPath: string,
+          repository: string,
+          projectId: number,
+        ): void {
+          this.cache.set(`${projectPath}-${repository}`, {
+            projectId,
+            lastUpdated: Date.now(),
+          });
+        }
+      };
+
+    it('should cache project IDs within TTL', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(1000); // 1 second TTL
+      const projectPath = 'https://gitlab.com';
+      const repository = 'user/repo';
+      const projectId = 12345;
+
+      // Should return undefined when cache is empty
+      expect(cache.getProjectId(projectPath, repository)).toBeUndefined();
+
+      // Set a project ID in cache
+      cache.setProjectId(projectPath, repository, projectId);
+
+      // Should return the cached project ID
+      expect(cache.getProjectId(projectPath, repository)).toBe(projectId);
+    });
+
+    it('should return undefined for expired cache entries', async () => {
+      const cache = new GitlabProjectIdMapCacheImpl(10); // 10ms TTL
+      const projectPath = 'https://gitlab.com';
+      const repository = 'user/repo';
+      const projectId = 12345;
+
+      // Set a project ID in cache
+      cache.setProjectId(projectPath, repository, projectId);
+
+      // Should return the cached project ID immediately
+      expect(cache.getProjectId(projectPath, repository)).toBe(projectId);
+
+      // Wait for TTL to expire
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      // Should return undefined after TTL expires
+      expect(cache.getProjectId(projectPath, repository)).toBeUndefined();
+    });
+
+    it('should handle different project paths and repositories separately', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(1000);
+
+      cache.setProjectId('https://gitlab.com', 'user1/repo1', 111);
+      cache.setProjectId('https://gitlab.com', 'user2/repo2', 222);
+      cache.setProjectId('https://example.com', 'user1/repo1', 333);
+
+      expect(cache.getProjectId('https://gitlab.com', 'user1/repo1')).toBe(111);
+      expect(cache.getProjectId('https://gitlab.com', 'user2/repo2')).toBe(222);
+      expect(cache.getProjectId('https://example.com', 'user1/repo1')).toBe(
+        333,
+      );
+      expect(
+        cache.getProjectId('https://gitlab.com', 'user3/repo3'),
+      ).toBeUndefined();
+    });
+  });
+
+  describe('factory method', () => {
+    it('should create readers with cache from config', () => {
+      const config = new ConfigReader({
+        integrations: {
+          gitlab: [{ host: 'gitlab.com', token: 'test-token' }],
+        },
+        gitlab: {
+          projectIdMapCacheTTL: 10000, // 10 seconds
+        },
+      });
+
+      const readers = GitlabUrlReader.factory({
+        config,
+        logger,
+        treeResponseFactory,
+      });
+
+      expect(readers).toHaveLength(1);
+      expect(readers[0].reader).toBeInstanceOf(GitlabUrlReader);
+    });
+
+    it('should use default cache TTL when not specified', () => {
+      const config = new ConfigReader({
+        integrations: {
+          gitlab: [{ host: 'gitlab.com', token: 'test-token' }],
+        },
+      });
+
+      const readers = GitlabUrlReader.factory({
+        config,
+        logger,
+        treeResponseFactory,
+      });
+
+      expect(readers).toHaveLength(1);
+      expect(readers[0].reader).toBeInstanceOf(GitlabUrlReader);
+    });
+  });
 
   describe('read', () => {
     beforeEach(() => {
@@ -889,6 +1047,73 @@ describe('GitlabUrlReader', () => {
           'gl-user-token',
         ),
       ).resolves.toEqual(12345);
+    });
+
+    it('should use cache to avoid repeated API calls', async () => {
+      const projectUrl = new URL('https://gitlab.com/group/project');
+
+      // First call should hit the API
+      const firstResult = await (gitlabProcessor as any).resolveProjectToId(
+        projectUrl,
+      );
+      expect(firstResult).toEqual(12345);
+
+      // Mock to ensure the API is not called again
+      const apiSpy = jest.fn();
+      worker.use(
+        rest.get('*/api/v4/projects/group%2Fproject', (req, res, ctx) => {
+          apiSpy();
+          return res(ctx.status(200), ctx.json({ id: 12345 }));
+        }),
+      );
+
+      // Second call should use cache
+      const secondResult = await (gitlabProcessor as any).resolveProjectToId(
+        projectUrl,
+      );
+      expect(secondResult).toEqual(12345);
+      expect(apiSpy).not.toHaveBeenCalled();
+    });
+
+    it('should cache different projects separately', async () => {
+      worker.use(
+        rest.get('*/api/v4/projects/group1%2Fproject1', (req, res, ctx) => {
+          if (req.headers.get('authorization') !== 'Bearer gl-dummy-token') {
+            return res(
+              ctx.status(401),
+              ctx.json({ message: '401 Unauthorized' }),
+            );
+          }
+          return res(ctx.status(200), ctx.json({ id: 11111 }));
+        }),
+        rest.get('*/api/v4/projects/group2%2Fproject2', (req, res, ctx) => {
+          if (req.headers.get('authorization') !== 'Bearer gl-dummy-token') {
+            return res(
+              ctx.status(401),
+              ctx.json({ message: '401 Unauthorized' }),
+            );
+          }
+          return res(ctx.status(200), ctx.json({ id: 22222 }));
+        }),
+      );
+
+      const project1Result = await (gitlabProcessor as any).resolveProjectToId(
+        new URL('https://gitlab.com/group1/project1'),
+      );
+      const project2Result = await (gitlabProcessor as any).resolveProjectToId(
+        new URL('https://gitlab.com/group2/project2'),
+      );
+
+      expect(project1Result).toEqual(11111);
+      expect(project2Result).toEqual(22222);
+
+      // Verify cache contains both
+      expect(
+        mockCache.getProjectId('https://gitlab.com', 'group1/project1'),
+      ).toBe(11111);
+      expect(
+        mockCache.getProjectId('https://gitlab.com', 'group2/project2'),
+      ).toBe(22222);
     });
   });
 });

@@ -19,6 +19,7 @@ import {
   getGitLabIntegrationRelativePath,
   GitLabIntegrationConfig,
 } from './config';
+import { GitlabProjectIdMapCache } from './types';
 
 /**
  * Given a URL pointing to a file on a provider, returns a URL that is suitable
@@ -41,8 +42,9 @@ export async function getGitLabFileFetchUrl(
   url: string,
   config: GitLabIntegrationConfig,
   token?: string,
+  projectIdMapCache?: GitlabProjectIdMapCache,
 ): Promise<string> {
-  const projectID = await getProjectId(url, config, token);
+  const projectID = await getProjectId(url, config, token, projectIdMapCache);
   return buildProjectUrl(url, projectID, config).toString();
 }
 
@@ -112,6 +114,7 @@ export async function getProjectId(
   target: string,
   config: GitLabIntegrationConfig,
   token?: string,
+  projectIdMapCache?: GitlabProjectIdMapCache,
 ): Promise<number> {
   const url = new URL(target);
 
@@ -131,12 +134,19 @@ export async function getProjectId(
     if (relativePath) {
       repo = repo.replace(relativePath, '');
     }
+    repo = repo.replace(/^\//, '');
+
+    const cacheKey = `${url.origin}${relativePath}-${repo}`;
+    const cacheEntry = projectIdMapCache?.getProjectId(cacheKey, repo);
+    if (cacheEntry) {
+      return cacheEntry;
+    }
 
     // Convert
     // to: https://gitlab.com/api/v4/projects/groupA%2Fteams%2FsubgroupA%2FteamA%2Frepo
     const repoIDLookup = new URL(
       `${url.origin}${relativePath}/api/v4/projects/${encodeURIComponent(
-        repo.replace(/^\//, ''),
+        repo,
       )}`,
     );
 
@@ -158,6 +168,8 @@ export async function getProjectId(
         `GitLab Error '${data.error}', ${data.error_description}`,
       );
     }
+
+    projectIdMapCache?.setProjectId(cacheKey, repo, Number(data.id));
 
     return Number(data.id);
   } catch (e) {

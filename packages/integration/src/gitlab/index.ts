@@ -23,4 +23,8 @@ export type { GitLabIntegrationConfig } from './config';
 export { getGitLabFileFetchUrl, getGitLabRequestOptions } from './core';
 export { GitLabIntegration, replaceGitLabUrlType } from './GitLabIntegration';
 export { DefaultGitlabCredentialsProvider } from './DefaultGitlabCredentialsProvider';
-export type { GitlabCredentials, GitlabCredentialsProvider } from './types';
+export type {
+  GitlabCredentials,
+  GitlabCredentialsProvider,
+  GitlabProjectIdMapCache,
+} from './types';

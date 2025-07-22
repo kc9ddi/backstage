@@ -28,3 +28,17 @@ export type GitlabCredentials = {
 export interface GitlabCredentialsProvider {
   getCredentials(opts: { url: string }): Promise<GitlabCredentials>;
 }
+
+/**
+ * A cache for GitLab project IDs.
+ *
+ * @public
+ */
+export interface GitlabProjectIdMapCache {
+  getProjectId(projectPath: string, repository: string): number | undefined;
+  setProjectId(
+    projectPath: string,
+    repository: string,
+    projectId: number,
+  ): void;
+}
