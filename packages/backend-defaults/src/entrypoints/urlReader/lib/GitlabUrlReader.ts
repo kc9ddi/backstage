@@ -55,19 +55,46 @@ interface GitlabProjectIdMapCacheEntry {
 class GitlabProjectIdMapCacheImpl implements GitlabProjectIdMapCache {
   private readonly cache = new Map<string, GitlabProjectIdMapCacheEntry>();
 
-  constructor(private readonly cacheTTL: number) {}
+  constructor(
+    private readonly cacheTTL: number,
+    private readonly maxSize: number,
+  ) {}
 
   getProjectId(projectPath: string, repository: string): number | undefined {
     const cacheKey = `${projectPath}-${repository}`;
     const cacheEntry = this.cache.get(cacheKey);
+
     if (cacheEntry && Date.now() - cacheEntry.lastUpdated < this.cacheTTL) {
+      // Move to end (most recently used) by deleting and re-inserting
+      this.cache.delete(cacheKey);
+      this.cache.set(cacheKey, cacheEntry);
       return cacheEntry.projectId;
     }
+
+    // Remove expired entry if it exists
+    if (cacheEntry) {
+      this.cache.delete(cacheKey);
+    }
+
     return undefined;
   }
 
   setProjectId(projectPath: string, repository: string, projectId: number) {
-    this.cache.set(`${projectPath}-${repository}`, {
+    const cacheKey = `${projectPath}-${repository}`;
+
+    // If entry already exists, delete it first (will be re-added at the end)
+    if (this.cache.has(cacheKey)) {
+      this.cache.delete(cacheKey);
+    } else if (this.cache.size >= this.maxSize) {
+      // Remove least recently used entry (first entry in the Map)
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey) {
+        this.cache.delete(firstKey);
+      }
+    }
+
+    // Add the new entry (will be at the end, most recently used)
+    this.cache.set(cacheKey, {
       projectId,
       lastUpdated: Date.now(),
     });
@@ -84,6 +111,7 @@ export class GitlabUrlReader implements UrlReaderService {
     const integrations = ScmIntegrations.fromConfig(config);
     const projectIdMapCache = new GitlabProjectIdMapCacheImpl(
       config.getOptionalNumber('gitlab.projectIdMapCacheTTL') ?? 1000 * 60 * 5, // 5 minutes
+      config.getOptionalNumber('gitlab.projectIdMapCacheMaxSize') ?? 500, // 500 entries
     );
     return integrations.gitlab.list().map(integration => {
       const reader = new GitlabUrlReader(integration, {

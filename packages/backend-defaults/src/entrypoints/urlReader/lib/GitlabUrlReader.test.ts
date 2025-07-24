@@ -112,7 +112,10 @@ describe('GitlabUrlReader', () => {
           { projectId: number; lastUpdated: number }
         >();
 
-        constructor(private readonly cacheTTL: number) {}
+        constructor(
+          private readonly cacheTTL: number,
+          private readonly maxSize: number,
+        ) {}
 
         getProjectId(
           projectPath: string,
@@ -120,12 +123,22 @@ describe('GitlabUrlReader', () => {
         ): number | undefined {
           const cacheKey = `${projectPath}-${repository}`;
           const cacheEntry = this.cache.get(cacheKey);
+
           if (
             cacheEntry &&
             Date.now() - cacheEntry.lastUpdated < this.cacheTTL
           ) {
+            // Move to end (most recently used) by deleting and re-inserting
+            this.cache.delete(cacheKey);
+            this.cache.set(cacheKey, cacheEntry);
             return cacheEntry.projectId;
           }
+
+          // Remove expired entry if it exists
+          if (cacheEntry) {
+            this.cache.delete(cacheKey);
+          }
+
           return undefined;
         }
 
@@ -134,7 +147,21 @@ describe('GitlabUrlReader', () => {
           repository: string,
           projectId: number,
         ): void {
-          this.cache.set(`${projectPath}-${repository}`, {
+          const cacheKey = `${projectPath}-${repository}`;
+
+          // If entry already exists, delete it first (will be re-added at the end)
+          if (this.cache.has(cacheKey)) {
+            this.cache.delete(cacheKey);
+          } else if (this.cache.size >= this.maxSize) {
+            // Remove least recently used entry (first entry in the Map)
+            const firstKey = this.cache.keys().next().value;
+            if (firstKey) {
+              this.cache.delete(firstKey);
+            }
+          }
+
+          // Add the new entry (will be at the end, most recently used)
+          this.cache.set(cacheKey, {
             projectId,
             lastUpdated: Date.now(),
           });
@@ -142,7 +169,7 @@ describe('GitlabUrlReader', () => {
       };
 
     it('should cache project IDs within TTL', () => {
-      const cache = new GitlabProjectIdMapCacheImpl(1000); // 1 second TTL
+      const cache = new GitlabProjectIdMapCacheImpl(1000, 500); // 1 second TTL, 500 max size
       const projectPath = 'https://gitlab.com';
       const repository = 'user/repo';
       const projectId = 12345;
@@ -158,7 +185,7 @@ describe('GitlabUrlReader', () => {
     });
 
     it('should return undefined for expired cache entries', async () => {
-      const cache = new GitlabProjectIdMapCacheImpl(10); // 10ms TTL
+      const cache = new GitlabProjectIdMapCacheImpl(10, 500); // 10ms TTL, 500 max size
       const projectPath = 'https://gitlab.com';
       const repository = 'user/repo';
       const projectId = 12345;
@@ -177,7 +204,7 @@ describe('GitlabUrlReader', () => {
     });
 
     it('should handle different project paths and repositories separately', () => {
-      const cache = new GitlabProjectIdMapCacheImpl(1000);
+      const cache = new GitlabProjectIdMapCacheImpl(1000, 500); // 1 second TTL, 500 max size
 
       cache.setProjectId('https://gitlab.com', 'user1/repo1', 111);
       cache.setProjectId('https://gitlab.com', 'user2/repo2', 222);
@@ -192,6 +219,100 @@ describe('GitlabUrlReader', () => {
         cache.getProjectId('https://gitlab.com', 'user3/repo3'),
       ).toBeUndefined();
     });
+
+    it('should enforce maximum cache size by evicting least recently used entries', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(10000, 3); // Long TTL, small max size for testing
+      const projectPath = 'https://gitlab.com';
+
+      // Fill cache to capacity
+      cache.setProjectId(projectPath, 'repo1', 111);
+      cache.setProjectId(projectPath, 'repo2', 222);
+      cache.setProjectId(projectPath, 'repo3', 333);
+
+      // All entries should be present
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(111);
+      expect(cache.getProjectId(projectPath, 'repo2')).toBe(222);
+      expect(cache.getProjectId(projectPath, 'repo3')).toBe(333);
+
+      // Add one more entry, should evict the oldest (repo1)
+      cache.setProjectId(projectPath, 'repo4', 444);
+
+      // repo1 should be evicted, others should remain
+      expect(cache.getProjectId(projectPath, 'repo1')).toBeUndefined();
+      expect(cache.getProjectId(projectPath, 'repo2')).toBe(222);
+      expect(cache.getProjectId(projectPath, 'repo3')).toBe(333);
+      expect(cache.getProjectId(projectPath, 'repo4')).toBe(444);
+    });
+
+    it('should move accessed entries to most recently used position', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(10000, 3); // Long TTL, small max size for testing
+      const projectPath = 'https://gitlab.com';
+
+      // Fill cache to capacity
+      cache.setProjectId(projectPath, 'repo1', 111);
+      cache.setProjectId(projectPath, 'repo2', 222);
+      cache.setProjectId(projectPath, 'repo3', 333);
+
+      // Access repo1 to move it to most recently used
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(111);
+
+      // Add one more entry, should evict repo2 (now oldest) instead of repo1
+      cache.setProjectId(projectPath, 'repo4', 444);
+
+      // repo2 should be evicted, repo1 should remain due to recent access
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(111);
+      expect(cache.getProjectId(projectPath, 'repo2')).toBeUndefined();
+      expect(cache.getProjectId(projectPath, 'repo3')).toBe(333);
+      expect(cache.getProjectId(projectPath, 'repo4')).toBe(444);
+    });
+
+    it('should handle updating existing entries without affecting cache size', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(10000, 2); // Long TTL, small max size for testing
+      const projectPath = 'https://gitlab.com';
+
+      // Fill cache to capacity
+      cache.setProjectId(projectPath, 'repo1', 111);
+      cache.setProjectId(projectPath, 'repo2', 222);
+
+      // Update existing entry with new project ID
+      cache.setProjectId(projectPath, 'repo1', 999);
+
+      // Both entries should still be present, repo1 should have updated ID
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(999);
+      expect(cache.getProjectId(projectPath, 'repo2')).toBe(222);
+
+      // Add new entry, should evict repo2 (oldest)
+      cache.setProjectId(projectPath, 'repo3', 333);
+
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(999);
+      expect(cache.getProjectId(projectPath, 'repo2')).toBeUndefined();
+      expect(cache.getProjectId(projectPath, 'repo3')).toBe(333);
+    });
+
+    it('should clean up expired entries when accessed', () => {
+      const cache = new GitlabProjectIdMapCacheImpl(10, 500); // 10ms TTL, large max size
+      const projectPath = 'https://gitlab.com';
+
+      // Set a project ID in cache
+      cache.setProjectId(projectPath, 'repo1', 111);
+
+      // Should return the cached project ID immediately
+      expect(cache.getProjectId(projectPath, 'repo1')).toBe(111);
+
+      // Wait for TTL to expire
+      return new Promise<void>(resolve => {
+        setTimeout(() => {
+          // Accessing expired entry should return undefined and clean it up
+          expect(cache.getProjectId(projectPath, 'repo1')).toBeUndefined();
+
+          // Add new entry to verify the expired one was cleaned up
+          cache.setProjectId(projectPath, 'repo2', 222);
+          expect(cache.getProjectId(projectPath, 'repo2')).toBe(222);
+
+          resolve();
+        }, 20);
+      });
+    });
   });
 
   describe('factory method', () => {
@@ -202,6 +323,7 @@ describe('GitlabUrlReader', () => {
         },
         gitlab: {
           projectIdMapCacheTTL: 10000, // 10 seconds
+          projectIdMapCacheMaxSize: 1000, // 1000 entries
         },
       });
 
@@ -215,10 +337,30 @@ describe('GitlabUrlReader', () => {
       expect(readers[0].reader).toBeInstanceOf(GitlabUrlReader);
     });
 
-    it('should use default cache TTL when not specified', () => {
+    it('should use default cache TTL and max size when not specified', () => {
       const config = new ConfigReader({
         integrations: {
           gitlab: [{ host: 'gitlab.com', token: 'test-token' }],
+        },
+      });
+
+      const readers = GitlabUrlReader.factory({
+        config,
+        logger,
+        treeResponseFactory,
+      });
+
+      expect(readers).toHaveLength(1);
+      expect(readers[0].reader).toBeInstanceOf(GitlabUrlReader);
+    });
+
+    it('should use custom cache max size from config', () => {
+      const config = new ConfigReader({
+        integrations: {
+          gitlab: [{ host: 'gitlab.com', token: 'test-token' }],
+        },
+        gitlab: {
+          projectIdMapCacheMaxSize: 100, // Custom max size
         },
       });
 
