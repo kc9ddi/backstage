@@ -274,16 +274,13 @@ describe('GitlabUrlReader', () => {
       cache.setProjectId(projectPath, 'repo1', 111);
       cache.setProjectId(projectPath, 'repo2', 222);
 
-      // Update existing entry with new project ID
+      // Update existing entry with new project ID (moves repo1 to most recently used)
       cache.setProjectId(projectPath, 'repo1', 999);
 
-      // Both entries should still be present, repo1 should have updated ID
-      expect(cache.getProjectId(projectPath, 'repo1')).toBe(999);
-      expect(cache.getProjectId(projectPath, 'repo2')).toBe(222);
-
-      // Add new entry, should evict repo2 (oldest)
+      // Add new entry, should evict repo2 (oldest after repo1 was updated)
       cache.setProjectId(projectPath, 'repo3', 333);
 
+      // Check final state: repo1 should still be present, repo2 should be evicted
       expect(cache.getProjectId(projectPath, 'repo1')).toBe(999);
       expect(cache.getProjectId(projectPath, 'repo2')).toBeUndefined();
       expect(cache.getProjectId(projectPath, 'repo3')).toBe(333);

@@ -110,8 +110,9 @@ export class GitlabUrlReader implements UrlReaderService {
   static factory: ReaderFactory = ({ config, treeResponseFactory }) => {
     const integrations = ScmIntegrations.fromConfig(config);
     const projectIdMapCache = new GitlabProjectIdMapCacheImpl(
-      config.getOptionalNumber('gitlab.projectIdMapCacheTTL') ?? 1000 * 60 * 5, // 5 minutes
-      config.getOptionalNumber('gitlab.projectIdMapCacheMaxSize') ?? 500, // 500 entries
+      config.getOptionalNumber('gitlab.projectIdMapCacheTTL') ??
+        1000 * 60 * 120, // 120 minutes
+      config.getOptionalNumber('gitlab.projectIdMapCacheMaxSize') ?? 1000, // 1000 entries
     );
     return integrations.gitlab.list().map(integration => {
       const reader = new GitlabUrlReader(integration, {
